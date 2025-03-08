@@ -17,7 +17,7 @@ Below is a **suggested README** for your **HybridShockWaveSim** repository. It *
   - Captures shock fronts with minimal numerical diffusion.  
   - Employs **AMR** to refine cells where steep gradients occur, ensuring high resolution while limiting computational cost.
 
-- **Machine Learning Integration (Optional)**:  
+- **Machine Learning Integration (InProgress)**:  
   - Trains neural networks or other ML models on solver outputs to provide **rapid** approximate predictions for real-gas shock states.  
   - Helps speed up parametric sweeps or repeated simulations.
 
@@ -32,7 +32,6 @@ HybridShockWaveSim/
   ├─ solver/
   │    ├─ analytics.py      # Real-gas EOS, extended Rankine–Hugoniot
   │    ├─ numerics.py       # FVM/FDM solver, AMR routines, time-integration
-  │    └─ ml_model.py       # (Optional) machine learning codes for speed-up
   ├─ visualization/
   │    └─ plot_bokeh.py     # Bokeh-based interactive shock profile viewer
   ├─ main.py                # Coordinates entire pipeline (analytic -> numeric -> ML -> visualize)
