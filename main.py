@@ -1,294 +1,260 @@
 #!/usr/bin/env python3
 """
-Hybrid Shock Wave Modeling in Non-Ideal Gases: Python Framework
+main.py
 
-This file outlines:
-1) A real-gas EOS (Peng–Robinson).
-2) Rankine–Hugoniot functions for shock validation.
-3) A finite-volume solver with optional flux limiting.
-4) A main entry point to set up, run, and validate a 1D shock tube simulation.
+A single script that:
+1) Defines a minimal finite-volume + AMR solver with a max cell cap.
+2) Uses Bokeh for interactive slider to adjust a parameter (e.g. omega),
+3) Re-runs the solver each time the slider changes, and
+4) Plots Pressure & Density in real-time in the browser.
+
+Run with:
+   bokeh serve --show main.py
 """
 
 import numpy as np
-import math
-from typing import Tuple
-from scipy.optimize import fsolve
-from scipy.integrate import quad
+from bokeh.plotting import figure, curdoc
+from bokeh.models import ColumnDataSource, Slider, Button
+from bokeh.layouts import column, row
 
-# ---------------------------------------------------------------------------
-# (A) Equation of State: Peng–Robinson
-# ---------------------------------------------------------------------------
-class PengRobinsonEOS:
-    """
-    Implements the Peng–Robinson EOS in standard form:
-    p = (R*T / (v - b)) - (a*alpha(T)) / (v^2 + 2*b*v - b^2)
-    
-    Attributes:
-      R   : gas constant
-      Tc  : critical temperature
-      Pc  : critical pressure
-      omega : accentric factor
-      a,b : computed from Tc, Pc
-      kappa, alpha : temperature function
-    """
-    def __init__(self, R: float, Tc: float, Pc: float, omega: float):
-        self.R = R
-        self.Tc = Tc
-        self.Pc = Pc
-        self.omega = omega
-        # PR correlation
-        # a = 0.45724 (R*Tc)^2 / Pc
-        # b = 0.07780 (R*Tc) / Pc
-        self.a = 0.45724 * (R*Tc)**2 / Pc
-        self.b = 0.07780 * (R*Tc) / Pc
+# ==================== 1) EOS & Helper Functions =====================
+def eos_pressure(rho, e_int, gamma=1.4):
+    """Ideal gas: p = (gamma-1)*rho*e. For demonstration."""
+    return (gamma - 1)*rho*e_int
 
-        # kappa = 0.37464 + 1.54226*omega - 0.26992*omega^2
-        self.kappa = 0.37464 + 1.54226*omega - 0.26992*(omega**2)
-
-    def alpha(self, T: float) -> float:
-        """Temperature-dependent alpha(T) in Peng–Robinson."""
-        Tr = T / self.Tc
-        return (1 + self.kappa*(1 - math.sqrt(Tr)))**2
-
-    def pressure(self, rho: float, T: float) -> float:
-        """
-        Compute pressure given density (rho) and temperature (T).
-        v = 1/rho (molar volume or specific volume depending on units).
-        """
-        v = 1.0 / rho
-        a_alpha = self.a * self.alpha(T)
-        term1 = (self.R * T) / (v - self.b)
-        term2 = a_alpha / (v**2 + 2*self.b*v - self.b**2)
-        return term1 - term2
-
-    def internal_energy(self, rho: float, T: float) -> float:
-        """
-        Compute internal energy per mass, e(rho,T).
-        Implementation of PR is not strictly straightforward. We'll do a
-        'residual' approach or numerical integral approach for demonstration.
-        
-        e = e_ideal(T) + e_residual(rho, T).
-        For demonstration, we do a simplified integration approach.
-        """
-        # For an ideal gas portion:
-        # e_ideal ~ c_v_ideal * T, assume c_v_ideal ~ (R/(gamma-1)) or from data
-        # For demonstration, pick a constant for c_v_ideal. 
-        # In reality, you'd define c_v(T) more accurately or use curve fits.
-        c_v_ideal = 2.5 * self.R  # simplistic example for a diatomic-like gas
-        e_ideal = c_v_ideal * T
-
-        # Residual part e_res:
-        # e_res = ∫(T dS_res) - ∫(p - p_ideal)dv, etc. 
-        # Here we do a quick numeric approach or zero for demonstration:
-        # A thorough approach might do an indefinite integral from a reference state.
-        e_res = self._residual_energy(rho, T)
-        return e_ideal + e_res
-
-    def _residual_energy(self, rho: float, T: float) -> float:
-        """
-        Very simplified placeholder for the 'residual energy' integration.
-        In practice, you'd implement the standard PR residual functions
-        or do a partial integration approach from a reference condition.
-        """
-        # For brevity, we just return 0.0 or a small correction.
+def eos_sound_speed(rho, p, gamma=1.4):
+    """c = sqrt(gamma * p / rho)."""
+    if rho < 1e-12 or p < 0:
         return 0.0
+    return np.sqrt(gamma * p / rho)
 
-# ---------------------------------------------------------------------------
-# (B) Rankine–Hugoniot Relations for Validation
-# ---------------------------------------------------------------------------
-def rankine_hugoniot_solution(eos, rho1, u1, T1) -> Tuple[float, float, float]:
+def cons_to_prim(U, gamma=1.4):
     """
-    Solve for (rho2, u2, T2) using the R–H jump conditions for a normal shock in a real gas.
-    We'll treat p1 = eos.pressure(rho1, T1).
-    Then we solve the system:
-        1) mass:   rho1 * u1 = rho2 * u2
-        2) momentum: p1 + rho1*u1^2 = p2 + rho2*u2^2
-        3) energy: h1 + 0.5*u1^2 = h2 + 0.5*u2^2
-    with p2 = eos.pressure(rho2, T2), h = e + p/rho.
-
-    This is a simplified approach that uses fsolve with 2 unknowns, say (rho2, T2),
-    and obtains u2 from mass conservation.
+    Convert [rho, rho*u, E] -> (rho, u, p).
+    E = rho e + 0.5*rho u^2, p=(gamma-1)*rho e
     """
-    import warnings
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    rho = U[0]
+    if rho<1e-12: rho=1e-12
+    u = U[1]/rho
+    e_int = (U[2] - 0.5*rho*u*u)/rho
+    p = eos_pressure(rho, e_int, gamma=gamma)
+    return (rho, u, p)
 
-    p1 = eos.pressure(rho1, T1)
-    e1 = eos.internal_energy(rho1, T1)
-    h1 = e1 + p1 / rho1
+def prim_to_cons(rho, u, p, gamma=1.4):
+    """(rho, u, p)->[rho, rho*u, E]. E=rho e+0.5*rho u^2,e = p/( (gamma-1)*rho )."""
+    e_int = p/((gamma-1)*rho)
+    E = rho*e_int + 0.5*rho*u*u
+    return np.array([rho, rho*u, E])
 
-    def equations(vars_):
-        rho2_, T2_ = vars_
-        # from continuity:
-        u2_ = (rho1 * u1) / rho2_
-        p2_ = eos.pressure(rho2_, T2_)
-        e2_ = eos.internal_energy(rho2_, T2_)
-        h2_ = e2_ + p2_ / rho2_
+# ==================== 2) Riemann Solver (Rusanov) =====================
+def rusanov_flux(UL, UR, gamma=1.4):
+    rhoL,uL,pL = cons_to_prim(UL,gamma=gamma)
+    rhoR,uR,pR = cons_to_prim(UR,gamma=gamma)
+    FL = np.array([rhoL*uL,
+                   rhoL*uL*uL + pL,
+                   (UL[2]+pL)*uL])
+    FR = np.array([rhoR*uR,
+                   rhoR*uR*uR + pR,
+                   (UR[2]+pR)*uR])
+    cL = eos_sound_speed(rhoL,pL,gamma=gamma)
+    cR = eos_sound_speed(rhoR,pR,gamma=gamma)
+    s_max= max(abs(uL)+cL, abs(uR)+cR)
+    return 0.5*(FL+FR) - 0.5*s_max*(UR-UL)
 
-        # eqn1 (momentum):
-        # p1 + rho1*u1^2 = p2 + rho2*u2^2
-        eq_mom = (p1 + rho1*u1*u1) - (p2_ + rho2_*u2_*u2_)
+# ==================== 3) Finite-Volume Step =====================
+def finite_volume_step(x,U,dt,gamma=1.4):
+    nx = len(x)
+    Unew = U.copy()
+    # flux array
+    F = np.zeros((nx+1, 3))
 
-        # eqn2 (energy):
-        # h1 + 0.5*u1^2 = h2 + 0.5*u2^2
-        eq_energy = (h1 + 0.5*u1*u1) - (h2_ + 0.5*u2_*u2_)
+    UL_bound = U[0]
+    UR_bound = U[-1]
 
-        return (eq_mom, eq_energy)
-
-    # initial guess:
-    rho2_guess = rho1 * 2.0
-    T2_guess   = T1 * 1.1
-    sol = fsolve(equations, (rho2_guess, T2_guess))
-    rho2_ = sol[0]
-    T2_   = sol[1]
-    u2_   = (rho1*u1) / rho2_
-
-    return (rho2_, u2_, T2_)
-
-# ---------------------------------------------------------------------------
-# (C) Finite-Volume Solver (1D)
-# ---------------------------------------------------------------------------
-def initialize_1dshocktube(num_cells=200, xL=0.0, xR=1.0):
-    """
-    Example: standard shock tube initial condition, but can be extended to real gas.
-    We'll define a left state and a right state.
-    """
-    x = np.linspace(xL, xR, num_cells)
-    rho   = np.zeros(num_cells)
-    u     = np.zeros(num_cells)
-    p     = np.zeros(num_cells)
-    T     = np.zeros(num_cells)
-
-    # Example: left side is high pressure, right side is low pressure
-    # with the same T for simplicity
-    mid = num_cells // 2
-    for i in range(num_cells):
-        if i < mid:
-            rho[i] = 5.0
-            p[i]   = 5e6  # 5 MPa, for instance
-            T[i]   = 400.0
-            u[i]   = 0.0
+    # compute flux at each interface
+    for i in range(nx+1):
+        if i==0:
+            FL_ = UL_bound
+            FR_ = U[0]
+        elif i==nx:
+            FL_ = U[-1]
+            FR_ = UR_bound
         else:
-            rho[i] = 1.0
-            p[i]   = 1e5  # 0.1 MPa
-            T[i]   = 300.0
-            u[i]   = 0.0
+            FL_ = U[i-1]
+            FR_ = U[i]
+        F[i] = rusanov_flux(FL_,FR_, gamma=gamma)
 
-    return x, rho, u, p, T
+    for i in range(nx):
+        if nx>1:
+            if i< nx-1:
+                dx_i = x[i+1]-x[i]
+            else:
+                dx_i = (x[i]-x[i-1]) if i>0 else 0.01
+        else:
+            dx_i= 0.01
+        if abs(dx_i)<1e-12:
+            dx_i=1e-12
 
-def compute_flux(eos, rho, u, E):
+        Unew[i] = U[i] - (dt/dx_i)*(F[i+1]-F[i])
+    return Unew
+
+# ==================== 4) AMR refine/coarsen =====================
+def refine_coarsen(x,U, refine_thresh=0.2, coarsen_thresh=0.05, gamma=1.4):
+    nx=len(x)
+    new_x=[]
+    new_U=[]
+    i=0
+    while i<nx:
+        if i==0 or i== nx-1:
+            new_x.append(x[i])
+            new_U.append(U[i])
+            i+=1
+            continue
+        rho_curr, _, _= cons_to_prim(U[i], gamma=gamma)
+        rho_prev, _, _= cons_to_prim(U[i-1], gamma=gamma)
+        dx_i= x[i] - x[i-1]
+        if abs(dx_i)<1e-12: dx_i=1e-12
+        grad_rho= abs(rho_curr-rho_prev)/dx_i
+
+        if grad_rho> refine_thresh:
+            # refine
+            x_left= x[i]-0.25*dx_i
+            x_right= x[i]+0.25*dx_i
+            halfU=0.5*U[i]
+            new_x.append(x_left)
+            new_U.append(halfU.copy())
+            new_x.append(x_right)
+            new_U.append(halfU.copy())
+            i+=1
+        elif grad_rho< coarsen_thresh and i< nx-1:
+            # coarsen
+            mergedU= U[i]+ U[i+1]
+            mergedX=0.5*(x[i]+ x[i+1])
+            new_x.append(mergedX)
+            new_U.append(mergedU)
+            i+=2
+        else:
+            new_x.append(x[i])
+            new_U.append(U[i])
+            i+=1
+
+    x_new= np.array(new_x)
+    U_new= np.array(new_U)
+    idx= np.argsort(x_new)
+    return x_new[idx],U_new[idx]
+
+# ==================== 5) Overall solver with max_cells =====================
+def run_amr_solver(x_init,U_init,tmax=0.0002, cfl=0.8,
+                   refine_thresh=0.2, coarsen_thresh=0.05, gamma=1.4,
+                   max_cells=50000):
+    x= x_init
+    U= U_init
+    time=0.0
+    while time< tmax:
+        # compute dt
+        smax=0.0
+        for i in range(len(x)):
+            r,u,p= cons_to_prim(U[i], gamma=gamma)
+            c= eos_sound_speed(r,p,gamma=gamma)
+            speed= abs(u)+c
+            if speed> smax:
+                smax= speed
+        if smax<1e-12:
+            dt=1e-6
+        else:
+            # minimal dx
+            min_dx=1e9
+            for j in range(len(x)-1):
+                dd= abs(x[j+1]-x[j])
+                if dd< min_dx:
+                    min_dx= dd
+            dt= cfl* min_dx / smax
+
+        if time+ dt> tmax:
+            dt= tmax- time
+
+        U= finite_volume_step(x,U,dt,gamma=gamma)
+        time+= dt
+
+        x,U= refine_coarsen(x,U, refine_thresh, coarsen_thresh,gamma=gamma)
+
+        # cap max cells
+        if len(x)> max_cells:
+            x= x[:max_cells]
+            U= U[:max_cells]
+            # or do other approach
+    return x, U, time
+
+# ==================== 6) Bokeh Visualization  =====================
+from bokeh.models import ColumnDataSource, Slider, Button
+from bokeh.layouts import column
+
+source= ColumnDataSource(data={'x':[], 'pressure':[], 'density':[]})
+plot= figure(title="Shock Wave w/ AMR", width=700, height=400,
+             x_axis_label='x', y_axis_label='Value')
+# We plot pressure in one color, density in another
+plot.line('x','pressure', source=source, color='blue', legend_label='Pressure(Pa)', line_width=2)
+plot.line('x','density', source=source, color='red', legend_label='Density(kg/m^3)', line_width=2)
+plot.legend.location="top_left"
+
+omega_slider= Slider(title="Parameter (ω)", start=0.1, end=0.5, value=0.3, step=0.01)
+run_button= Button(label="Run AMR Solver", button_type="success")
+
+def run_solver_with_omega(omega):
     """
-    Compute inviscid flux for the Euler system in 1D:
-      U = [rho, rho*u, E]
-      F = [rho*u, rho*u^2 + p, (E + p)*u]
-    p is from the EOS; E = rho*e + 0.5*rho*u^2
+    We define a small domain or vary initial conditions w.r.t. omega
+    Then run solver. Return x, p, rho for bokeh.
     """
-    flux = np.zeros((3, len(rho)))
-    for i in range(len(rho)):
-        # retrieve p from internal energy or from stored data
-        # e = (E[i] - 0.5*rho[i]*u[i]^2)/rho[i]
-        # but let's do direct approach using:
-        # E = rho* e + 0.5*rho u^2
-        e = (E[i] - 0.5*rho[i]*u[i]*u[i]) / rho[i]
-        # approximate T or store it. We'll do a placeholder approach:
-        # for a real code, you might store T in an array or do iterative solve.
-        # We'll do a naive guess or skip temperature for flux. We'll do p from known e, rho if possible
-        # For demonstration, let's assume we track T separately. This is a major detail in real codes.
-        # => we do a simpler approach: p is a separate array or we have p in memory
-        # This function might need a 'p' array passed in too.
-        # We'll keep it consistent with the function signature for now.
+    # create initial conditions
+    nx0= 20
+    x_init= np.linspace(0,1,nx0)
+    U_init= np.zeros((nx0,3))
+    # e.g. left side: rho=1, p=1e5 minus some fraction of ω
+    for i in range(nx0):
+        if x_init[i]<0.5:
+            rho= 1.0
+            p= 1e5
+        else:
+            rho= 0.125
+            p= 1e4
+        # slightly vary it with omega
+        p*= (1+ 0.2*(omega-0.3))
+        # convert
+        e_int= p/((1.4-1)*rho)
+        E= rho* e_int
+        U_init[i]=[rho,0,E]
 
-        # We'll do a placeholder p[i], which is not correct if e changes
-        # In reality, you'd pass in p array or do a direct EOS solve. 
-        # We'll pass, let the function sign remain. 
-        # Here, flux is standard Euler form:
-        pass
+    x_final,U_final,_= run_amr_solver(x_init,U_init,tmax=0.0002,
+                                      cfl=0.8, refine_thresh=0.2,
+                                      coarsen_thresh=0.05, gamma=1.4,
+                                      max_cells=50000)
+    # Convert final state to arrays for pressure, density
+    pressure_list=[]
+    density_list=[]
+    for i in range(len(x_final)):
+        r,u,p= cons_to_prim(U_final[i], gamma=1.4)
+        pressure_list.append(p)
+        density_list.append(r)
+    return x_final, pressure_list, density_list
 
-    return flux  # Not fully implemented
+def update_data():
+    # read slider
+    omega= omega_slider.value
+    x_f, p_f, rho_f= run_solver_with_omega(omega)
+    source.data= {'x':x_f, 'pressure':p_f, 'density':rho_f}
 
-def fv_solver_1D(eos, x, rho, u, p, T, cfl=0.4, max_steps=100):
-    """
-    Simplified 1D finite-volume update (Godunov or Roe) for demonstration.
-    We'll skip details of Riemann solver or flux limiter for brevity,
-    but outline how you'd integrate over time.
-    """
-    dx = x[1] - x[0]
-    num_cells = len(x)
-    
-    # Convert to conservative variables
-    U = np.zeros((3, num_cells))
-    for i in range(num_cells):
-        E = eos.internal_energy(rho[i], T[i])*rho[i] + 0.5*rho[i]*(u[i]**2)
-        U[0,i] = rho[i]
-        U[1,i] = rho[i]*u[i]
-        U[2,i] = E
+def on_slider_change(attr, old, new):
+    # Could do immediate re-run, or wait for button
+    pass
 
-    time_step = 0
-    while time_step < max_steps:
-        # 1) Compute wave speeds or local sound speeds to get dt (CFL-based)
-        a = np.zeros(num_cells)
-        for i in range(num_cells):
-            # approximate speed of sound => partial derivative from EOS
-            # In PR or real-gas, c^2 = (dp/d rho) @ constant entropy ~ complicated
-            # We'll do a simplified approach, assume c^2 ~ gamma * p / rho
-            # This is an approximation for demonstration. 
-            # If we want the real approach, we do partial derivatives of p w.r.t rho, see PR formula.
-            gamma_eff = 1.4  # placeholder
-            # compute p from U:
-            # e = (U[2,i] - 0.5*(U[1,i]^2)/U[0,i]) / U[0,i]
-            # p = (some real-gas formula)
-            # We'll do a naive approach:
-            # ...
-            c_approx = math.sqrt(gamma_eff * 1e5 / U[0,i])  # placeholder
-            a[i] = c_approx
+def on_run_button_clicked():
+    update_data()
 
-        dt = cfl * dx / max(abs(u) + a.max())  # simplistic global dt
+omega_slider.on_change('value', on_slider_change)
+run_button.on_click(on_run_button_clicked)
 
-        # 2) Compute fluxes (numerical flux with Riemann solver or flux difference splitting)
-        # We'll just do a dummy approach for demonstration:
-        F = np.zeros((3, num_cells+1))  # flux at cell interfaces
-        # TODO: fill in with a real Riemann solver approach
+# do an initial run
+update_data()
 
-        # 3) Update U by finite-volume approach:
-        for i in range(1, num_cells-1):
-            for comp in range(3):
-                U[comp,i] = U[comp,i] - (dt/dx)*(F[comp,i+1] - F[comp,i])
-
-        time_step += 1
-
-    # after max_steps, convert back to (rho,u,p,T) if needed
-    # ...
-    return U
-
-# ---------------------------------------------------------------------------
-# (D) Main Routine: Putting it all together
-# ---------------------------------------------------------------------------
-def main():
-    # 1) Choose EOS
-    # e.g., for CO2 near critical region:
-    R = 8.314  # J/(mol.K) => or specify in consistent units
-    Tc = 304.2
-    Pc = 7.38e6
-    omega = 0.225
-    eos = PengRobinsonEOS(R, Tc, Pc, omega)
-
-    # 2) Initialize 1D domain with shock tube conditions
-    x, rho, u, p, T = initialize_1dshocktube()
-
-    # 3) (Optional) check an R–H solution for a single interface:
-    # Suppose left state = (rhoL, uL, T_L), right state = ...
-    # This is a quick demonstration of the rankine_hugoniot_solution usage
-    # We'll do it for the left state to see the post-shock state if there's a shock
-    (rho2, u2, T2) = rankine_hugoniot_solution(eos, rho[0], u[0], T[0])
-    print("R-H result for left state => rho2=%.2f, u2=%.2f, T2=%.2f" % (rho2, u2, T2))
-
-    # 4) Run the finite-volume solver
-    U_final = fv_solver_1D(eos, x, rho, u, p, T, cfl=0.4, max_steps=50)
-
-    # 5) Post-processing or validation
-    # In real usage, you'd convert U_final -> (rho_final, u_final, p_final, T_final)
-    # Then compare shock position or post-shock states to the R-H solution
-    print("Simulation complete. Analyze results, compare with R–H solution or experiments.")
-
-
-if __name__ == "__main__":
-    main()
+layout= column(omega_slider, run_button, plot)
+curdoc().add_root(layout)

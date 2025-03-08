@@ -1,0 +1,12 @@
+# requirements.txt
+
+numpy>=1.21
+scipy>=1.7
+bokeh>=2.4
+pandas>=1.1
+matplotlib>=3.3
+numba>=0.53
+scikit-learn>=0.24
+scikit-image>=0.18
+scikit-learn-extra>=0.2
+scipy>=1.7
