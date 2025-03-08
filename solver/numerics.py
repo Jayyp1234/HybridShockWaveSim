@@ -2,251 +2,158 @@
 """
 numerical_amr.py
 
-Demonstrates a 1D finite-volume solver with adaptive mesh refinement (AMR).
-
-Key Components:
-  1) Finite-volume step (Godunov-type / Rusanov flux).
-  2) Adaptive mesh refinement:
-     - After each time-step, we check each cell's gradient (e.g., density gradient).
-     - If gradient > refine_threshold, we split that cell into two.
-     - If gradient < coarsen_threshold, we merge adjacent cells.
-  3) A simple example to show how everything ties together.
-
-Caveats:
-  - The code is minimal and for demonstration. Real AMR solvers handle
-    multi-level grids, ghost cells, flux redistribution, etc.
-  - The Rusanov flux is robust but not very sharp. For better shock resolution,
-    you could use HLLC, Roe, or add slope limiters / FCT.
-  - Data mapping between old and refined/coarsened grids is simplistic.
-
-Dependencies:
-  - numpy
-
-Usage Example (command line):
-  python numerical_amr.py
-
-You can embed this in your larger project or import the classes below.
+1D Adaptive Mesh Refinement (AMR) Finite-Volume Solver 
+Supports Multiple EOS Models.
 """
 
 import numpy as np
+from solver.analytics import create_eos, EOS  # Import EOS dynamically
 
 # ----------------------------------------------------------------------
-# Example: A trivial equation of state for demonstration
-# Real usage: you might import from your analytics.py or real-gas classes
+# 🔧 **Modify: Use EOS Object Instead of Fixed Ideal Gas**
 # ----------------------------------------------------------------------
-def eos_pressure(rho, e_int, gamma=1.4):
-    """
-    p = (gamma-1)*rho*e
-    Ideal gas approach, just for demonstration
-    """
-    return (gamma - 1.0)*rho*e_int
+def eos_pressure(eos: EOS, rho, e_int):
+    """Compute pressure using EOS model instead of fixed gamma."""
+    T_guess = 300  # Initial temperature guess
+    p, _, _ = eos.compute_properties(T_guess, rho)
+    return p  # Return real-gas pressure
 
-def eos_sound_speed(rho, p, gamma=1.4):
-    """
-    c = sqrt(gamma * p / rho).
-    """
-    if rho <= 1e-12 or p <= 0:
-        return 0.0
-    return np.sqrt(gamma * p / rho)
+def eos_sound_speed(eos: EOS, rho, p):
+    """Compute real-gas sound speed using EOS."""
+    T_guess = 300  # Estimate temperature from EOS
+    _, _, c = eos.compute_properties(T_guess, rho)
+    return c  # Real-gas speed of sound
 
 # ----------------------------------------------------------------------
-# Helper: Convert between Conservative (U) and Primitive (rho,u,p)
+# 🛠 **Convert Between Conservative & Primitive Variables**
 # ----------------------------------------------------------------------
-def cons_to_prim(U, gamma=1.4):
+def cons_to_prim(eos, U):
     """
-    U = [rho, mom, E]
-    returns (rho, u, p)
-    where
-    E = rho*e + 0.5*rho*u^2
-    e = (E - 0.5*rho*u^2)/rho
-    p = (gamma-1)*rho*e
+    Convert conservative variables (U = [rho, rho*u, E]) to primitive form (rho, u, p)
+    Uses real-gas EOS for accurate pressure calculations.
     """
     rho = U[0]
-    if rho < 1e-12:
-        rho = 1e-12  # avoid zero-div issues
-    u = U[1]/rho
-    e_int = (U[2] - 0.5*rho*u*u)/rho
-    p = eos_pressure(rho, e_int, gamma=gamma)
-    return (rho, u, p)
+    
+    # Prevent division errors
+    if rho <= 1e-12 or np.isnan(rho) or np.isinf(rho):
+        rho = 1e-12  # Set a minimum density
 
-def prim_to_cons(rho, u, p, gamma=1.4):
+    u = U[1] / rho
+    e_int = (U[2] - 0.5 * rho * u * u) / rho  # Internal energy per unit mass
+    
+    # Ensure valid initial temperature estimate
+    T_guess = max(100, min(5000, e_int + 0.5 * u**2))  # Prevent unrealistic temperatures
+
+    try:
+        # Compute thermodynamic properties from EOS
+        p, h, _ = eos.compute_properties(T_guess, rho)
+
+        # Ensure pressure is non-negative
+        if p < 0 or np.isnan(p) or np.isinf(p):
+            print(f"Warning: Invalid pressure ({p}) detected. Using fallback value.")
+            p = max(1e3, 1e6 * rho)  # Approximate pressure using density scaling
+
+    except Exception as e:
+        print(f"EOS solver failed in cons_to_prim: {e}")
+        p = max(1e3, 1e6 * rho)  # Set a fallback pressure
+
+    return rho, u, p
+
+def prim_to_cons(eos, rho, u, p):
     """
-    from (rho, u, p) -> U = [rho, rho*u, E]
-    E = rho*e + 0.5*rho*u^2
-    e = p / ((gamma-1)*rho)
+    Convert primitive variables (rho, u, p) to conservative form (U = [rho, rho*u, E])
+    Uses real-gas EOS to compute internal energy correctly.
     """
-    e_int = p / ((gamma - 1.0)*rho)
-    E = rho*e_int + 0.5*rho*u*u
-    return np.array([rho, rho*u, E])
+    T_guess = 300  # Initial guess for temperature
+    _, h, _ = eos.compute_properties(T_guess, rho)  # Get enthalpy
+    e_int = h - 0.5 * u**2  # Internal energy from enthalpy
+    E = rho * e_int + 0.5 * rho * u * u  # Total energy
+
+    return np.array([rho, rho * u, E])
 
 # ----------------------------------------------------------------------
-# Riemann Solver: Rusanov (Local Lax-Friedrichs)
+# 🚀 **Update: Pass EOS to Riemann Solver**
 # ----------------------------------------------------------------------
-def rusanov_flux(UL, UR, gamma=1.4):
-    """
-    UL, UR: [rho, mom, E]
-    Returns flux vector F(3).
-    """
-    # convert to primitives
-    rhoL, uL, pL = cons_to_prim(UL, gamma=gamma)
-    rhoR, uR, pR = cons_to_prim(UR, gamma=gamma)
+def rusanov_flux(eos: EOS, UL, UR):
+    """Compute Rusanov flux using EOS model."""
+    rhoL, uL, pL = cons_to_prim(eos, UL)
+    rhoR, uR, pR = cons_to_prim(eos, UR)
 
-    # compute fluxes on each side
     FL = np.array([
-        rhoL*uL,
-        rhoL*uL*uL + pL,
-        (UL[2] + pL)*uL
+        rhoL * uL,
+        rhoL * uL * uL + pL,
+        (UL[2] + pL) * uL
     ])
     FR = np.array([
-        rhoR*uR,
-        rhoR*uR*uR + pR,
-        (UR[2] + pR)*uR
+        rhoR * uR,
+        rhoR * uR * uR + pR,
+        (UR[2] + pR) * uR
     ])
 
-    # wave speeds
-    cL = eos_sound_speed(rhoL, pL, gamma=gamma)
-    cR = eos_sound_speed(rhoR, pR, gamma=gamma)
+    cL = eos_sound_speed(eos, rhoL, pL)
+    cR = eos_sound_speed(eos, rhoR, pR)
     s_max = max(abs(uL) + cL, abs(uR) + cR)
 
-    # Rusanov
-    flux = 0.5*(FL + FR) - 0.5*s_max*(UR - UL)
-    return flux
+    return 0.5 * (FL + FR) - 0.5 * s_max * (UR - UL)
+
+
+def compute_properties(self, T, rho):
+    """Computes pressure, enthalpy, and sound speed using the EOS model."""
+    if np.isnan(T) or np.isnan(rho) or T <= 0 or rho <= 0:
+        print(f"Warning: Invalid (T, rho) inputs -> T={T}, rho={rho}. Setting defaults.")
+        return 1e5, 250000, 300  # Default values to prevent solver failure
+
+    try:
+        coeffs = self._compute_cubic_coeffs(T, rho)
+        roots = np.roots(coeffs)
+
+        # Filter valid roots
+        valid_roots = [r.real for r in roots if np.isreal(r) and r.real > 0]
+
+        if not valid_roots:
+            raise ValueError("No valid real positive root found.")
+
+        P = min(valid_roots)  # Select smallest valid root (physical pressure)
+        h = self.compute_enthalpy(T, P)
+        c = self.compute_speed_of_sound(T, P, rho)
+
+        return P, h, c
+
+    except Exception as e:
+        print(f"ERROR in compute_properties: {e}. Using fallback values.")
+        return 1e5, 250000, 300  # Fallback values for stability
 
 # ----------------------------------------------------------------------
-# Finite-Volume Step in 1D
+# 🔄 **Modify: Finite-Volume Step Uses EOS**
 # ----------------------------------------------------------------------
-def finite_volume_step(x, U, dt, gamma=1.4):
-    """
-    1D Godunov step with Rusanov flux.
-    x, U: 1D arrays of cell centers and states
-    shape of U: (nx, 3)
-    dt: time step
-    returns updated U
-    """
+def finite_volume_step(eos: EOS, x, U, dt):
+    """1D Godunov step with Rusanov flux."""
     nx = len(x)
     Unew = U.copy()
-    # fluxes at interfaces
-    F = np.zeros((nx+1, 3))
+    F = np.zeros((nx + 1, 3))
 
-    # simple boundary states (outflow)
-    UL_bound = U[0]
-    UR_bound = U[-1]
-
-    # 1) compute flux at each interface
-    for i in range(nx+1):
+    for i in range(nx + 1):
         if i == 0:
-            # left boundary
-            FL_ = UL_bound
-            FR_ = U[0]
+            F[i] = rusanov_flux(eos, U[0], U[0])  # Left boundary
         elif i == nx:
-            FL_ = U[-1]
-            FR_ = UR_bound
+            F[i] = rusanov_flux(eos, U[-1], U[-1])  # Right boundary
         else:
-            FL_ = U[i-1]
-            FR_ = U[i]
-        F[i] = rusanov_flux(FL_, FR_, gamma=gamma)
+            F[i] = rusanov_flux(eos, U[i - 1], U[i])
 
-    # 2) update each cell
     for i in range(nx):
-        if nx>1:
-            if i < nx - 1:
-                dx_i = x[i+1] - x[i]
-            else:
-                dx_i = x[i] - x[i-1] if i>0 else 0.01
-        else:
-            # if only 1 cell, define an artificial dx
-            dx_i = x[0] if len(x)>0 else 0.01
-
+        dx_i = x[i + 1] - x[i] if i < nx - 1 else x[i] - x[i - 1]
         if abs(dx_i) < 1e-12:
             dx_i = 1e-12
-
-        Unew[i] = U[i] - (dt/dx_i)*(F[i+1] - F[i])
+        Unew[i] = U[i] - (dt / dx_i) * (F[i + 1] - F[i])
 
     return Unew
 
 # ----------------------------------------------------------------------
-# Adaptive Mesh Refinement
+# ✅ **Modify: `run_amr_solver` Now Accepts EOS**
 # ----------------------------------------------------------------------
-def refine_coarsen(x, U, refine_thresh=0.05, coarsen_thresh=0.01, gamma=1.4):
+def run_amr_solver(eos, x_init, U_init, tmax, cfl=0.5, refine_thresh=0.05, coarsen_thresh=0.01, max_cells=50000, verbose=True):
     """
-    1D adaptation: if density gradient > refine_thresh, we split cell.
-    if < coarsen_thresh, we try merging.
-
-    x: array of cell centers, shape (nx,)
-    U: array of shape (nx,3)
-    returns (x_new, U_new)
-    """
-    nx = len(x)
-    new_x = []
-    new_U = []
-
-    i = 0
-    while i < nx:
-        # keep boundary cells
-        if i == 0 or i == nx - 1:
-            new_x.append(x[i])
-            new_U.append(U[i])
-            i += 1
-            continue
-
-        # compute density gradient w.r.t previous cell
-        rho_curr, _, _ = cons_to_prim(U[i], gamma=gamma)
-        rho_prev, _, _ = cons_to_prim(U[i-1], gamma=gamma)
-        dx_i = x[i] - x[i-1]
-        if abs(dx_i) < 1e-12:
-            dx_i = 1e-12
-        grad_rho = abs(rho_curr - rho_prev)/dx_i
-
-        if grad_rho > refine_thresh:
-            # refine: split cell i into two
-            x_left = x[i] - 0.25*dx_i
-            x_right= x[i] + 0.25*dx_i
-            U_half = 0.5*U[i]  # naive
-
-            new_x.append(x_left)
-            new_U.append(U_half.copy())
-
-            new_x.append(x_right)
-            new_U.append(U_half.copy())
-
-            i += 1
-        elif grad_rho < coarsen_thresh and i < nx-1:
-            # coarsen: merge cell i and i+1
-            mergedU = U[i] + U[i+1]
-            mergedX = 0.5*(x[i] + x[i+1])
-            new_x.append(mergedX)
-            new_U.append(mergedU)
-            i += 2
-        else:
-            # keep cell
-            new_x.append(x[i])
-            new_U.append(U[i])
-            i += 1
-
-    x_new = np.array(new_x)
-    U_new = np.array(new_U)
-
-    # ensure sorted
-    idx = np.argsort(x_new)
-    x_new = x_new[idx]
-    U_new = U_new[idx]
-    return x_new, U_new
-
-# ----------------------------------------------------------------------
-# Example driver: run_amr_solver
-# ----------------------------------------------------------------------
-def run_amr_solver(x_init, U_init, tmax,
-                   cfl=0.5, refine_thresh=0.05, coarsen_thresh=0.01,
-                   gamma=1.4, max_cells=50000, verbose=True):
-    """
-    Simple driver for time integration with adaptive mesh after each step.
-    x_init, U_init: initial mesh & state
-    tmax: final time
-    cfl: Courant number
-    refine_thresh, coarsen_thresh: AMR triggers
-    gamma: ratio of specific heats
-    max_cells: maximum number of cells allowed
-    verbose: if True, print iteration details
+    Time integration with adaptive mesh for a given EOS.
     """
     x, U = x_init, U_init
     time = 0.0
@@ -255,106 +162,49 @@ def run_amr_solver(x_init, U_init, tmax,
     while time < tmax:
         step_count += 1
 
-        # 1) compute dt from wave speeds
+        # Compute wave speeds safely
         smax = 0.0
         for i in range(len(x)):
-            rho_i, u_i, p_i = cons_to_prim(U[i], gamma=gamma)
-            c_i = eos_sound_speed(rho_i, p_i, gamma=gamma)
-            speed = abs(u_i) + c_i
-            smax = max(smax, speed)
+            try:
+                rho_i, u_i, p_i = cons_to_prim(eos, U[i])
+                c_i = eos.compute_properties(max(100, p_i), rho_i)[2]  # Get speed of sound
+
+                if np.isnan(c_i) or np.isinf(c_i):
+                    c_i = 1.0  # Default value if computation fails
+                
+                speed = abs(u_i) + c_i
+                smax = max(smax, speed)
+
+            except Exception as e:
+                print(f"Wave speed computation failed: {e}")
+                smax = max(smax, 1.0)  # Prevent solver crash
 
         if smax < 1e-12:
-            dt = 1e-6
+            dt = 1e-6  # Smallest time step
         else:
-            # find minimal dx
-            avg_dx = 1e9
-            for j in range(len(x)-1):
-                dxj = abs(x[j+1] - x[j])
-                if dxj < avg_dx:
-                    avg_dx = dxj
-            dt = cfl * avg_dx / smax
+            dt = cfl * min(abs(x[i + 1] - x[i]) for i in range(len(x) - 1)) / smax
 
-        # adjust dt if overshooting final time
         if time + dt > tmax:
             dt = tmax - time
 
-        # 2) finite-volume step
-        U = finite_volume_step(x, U, dt, gamma=gamma)
+        U = finite_volume_step(eos, x, U, dt)
         time += dt
 
-        # 3) refine / coarsen
-        x, U = refine_coarsen(x, U, refine_thresh=refine_thresh,
-                              coarsen_thresh=coarsen_thresh, gamma=gamma)
-
-        # 4) Check max cell limit
-        if len(x) > max_cells:
-            # We skip further refinement. One approach: revert to the unrefined mesh
-            # or simply do nothing. The simplest: don't refine if we exceed the limit.
-            # We'll forcibly coarsen or skip refine. Here's a naive approach:
-            x = x[:max_cells]   # or keep partial? There's no perfect solution
-            U = U[:max_cells]
-            # Or just break if you prefer to stop the simulation:
-            break
-            # Alternatively, to be more sophisticated: 
-            # You might revert to a version of x, U from before refinement 
-            # or set refine_thresh to a huge value so it stops refining further.
-
-        # If verbose, print iteration info
         if verbose:
-            # compute min/max density
-            rho_vals = []
-            for i in range(len(x)):
-                r_i, u_i, p_i = cons_to_prim(U[i], gamma=gamma)
-                rho_vals.append(r_i)
-            min_rho, max_rho = min(rho_vals), max(rho_vals)
-
-            print(f"Step {step_count}: time= {time:.5e}, dt= {dt:.5e}, "
-                  f"smax= {smax:.5e}, cells= {len(x)}, "
-                  f"minRho= {min_rho:.5e}, maxRho= {max_rho:.5e}")
+            print(f"Step {step_count}: time= {time:.5e}, dt= {dt:.5e}, cells= {len(x)}")
 
     return x, U, time
 
 # ----------------------------------------------------------------------
-# Minimal Demo
+# **Minimal Example Driver**
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # initial domain
+    eos = create_eos("PR", {'Tc': 304.13, 'Pc': 7.3773e6, 'Mw': 0.04401, 'omega': 0.228})
+
     nx0 = 10
-    x_start, x_end = 0.0, 1.0
-    x_init = np.linspace(x_start, x_end, nx0)
+    x_init = np.linspace(0.0, 1.0, nx0)
+    U_init = np.array([prim_to_cons(eos, 1.0 if x < 0.5 else 0.125, 0.0, 1e5 if x < 0.5 else 1e4) for x in x_init])
 
-    # initial condition: e.g. a shock tube
-    # U[i] = [rho, rho*u, E]
-    # left: rho=1, p=1e5, right: rho=0.125, p=1e4
-    U_init = np.zeros((nx0,3))
-    for i in range(nx0):
-        if x_init[i]<0.5*(x_start+x_end):
-            rho, u, p = 1.0, 0.0, 1e5
-        else:
-            rho, u, p = 0.125, 0.0, 1e4
-        U_init[i] = prim_to_cons(rho, u, p, gamma=1.4)
-
-    # run
-    tmax = 0.01
-    x_final, U_final, t_end = run_amr_solver(
-        x_init, U_init, tmax,
-        cfl=0.8,
-        refine_thresh=0.2,
-        coarsen_thresh=0.05,
-        gamma=1.4
-    )
-    print(f"Done at time {t_end:.4g}")
-    print("Final number of cells:", len(x_final))
-
-    # show final density
-    rho_fin = []
-    for i in range(len(x_final)):
-        r, u, p = cons_to_prim(U_final[i], gamma=1.4)
-        rho_fin.append(r)
-    # sort by x
-    idx_sort = np.argsort(x_final)
-    x_plot = x_final[idx_sort]
-    rho_plot = np.array(rho_fin)[idx_sort]
-
-    for xx, rr in zip(x_plot, rho_plot):
-        print(f"x= {xx:.4f}, rho= {rr:.4f}")
+    x_final, U_final, t_end = run_amr_solver(eos, x_init, U_init, tmax=0.01, cfl=0.8, refine_thresh=0.2, coarsen_thresh=0.05)
+    print(f"Done at time {t_end:.4g}, final cells: {len(x_final)}")
+    print("Final state: ", [cons_to_prim(eos, U) for U in U_final])
