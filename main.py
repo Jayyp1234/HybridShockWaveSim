@@ -153,6 +153,7 @@ def main():
     plt.figure(figsize=(8, 5))
     for eos_name in eos_models:
         plt.plot(eos_results[eos_name]["x"], eos_results[eos_name]["rho"], linestyle="--", label=f"{eos_name} EOS")
+        
     plt.scatter(x_exp, rho_exp, color="red", label="Experimental Data", marker="o")
     plt.xlabel("Position (x)")
     plt.ylabel("Density")

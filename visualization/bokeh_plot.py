@@ -97,6 +97,7 @@ update_plot(None, None, None)
 # Layout
 curdoc().add_root(column(eos_selector, density_slider, plot_density, pressure_slider, plot_pressure))
 
+
 def start_bokeh_server():
     """Launches the Bokeh server from within Python (for automatic execution in main.py)."""
-    os.system("bokeh serve --show visualization/bokeh_plot.py --port 5010")
+    os.system("bokeh serve --show visualization/bokeh_plot.py --allow-websocket-origin=localhost:5006")

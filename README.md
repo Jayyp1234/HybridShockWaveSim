@@ -1,7 +1,5 @@
 # HybridShockWaveSim
 
-Below is a **suggested README** for your **HybridShockWaveSim** repository. It **succinctly** describes the project’s purpose, structure, usage, and any relevant references. You can adapt or shorten it based on your exact needs:
-
 **HybridShockWaveSim** implements a **hybrid computational framework** for simulating **shock waves in non-ideal gases**. It combines **extended Rankine–Hugoniot** models (using **Peng–Robinson** and **Redlich–Kwong** equations of state), **high-fidelity** finite-volume (or finite-difference) simulations with **adaptive mesh refinement (AMR)**, and an optional **machine learning** module for fast predictions in real-gas shock scenarios.
 
 ## Key Features
@@ -47,10 +45,12 @@ HybridShockWaveSim/
 ## Installation
 
 1. Clone this repository:
+
    ```bash
-   git clone https://github.com/YourUsername/HybridShockWaveSim.git
+   git clone https://github.com/Jayyp1234/HybridShockWaveSim.git
    ```
 2. Install Python dependencies:
+
    ```bash
    cd HybridShockWaveSim
    pip install -r requirements.txt
